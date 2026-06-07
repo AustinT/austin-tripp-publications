@@ -20,6 +20,16 @@ BibTeX bibliography for Austin Tripp, split by publication venue type.
   - `ownwork` — entries where Austin is the primary contributor (used
     e.g. to mark them with an asterisk in formatted CV output).
 
+## Setup (after cloning)
+
+Enable the committed pre-commit hook — a one-time step per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+The hook runs `biber --tool` on staged `.bib` files and fails the commit on parse errors. It requires `biber` (ships with most TeX distributions); it skips silently if `biber` is not on your PATH.
+
 ## Consumers
 
 - [`AustinT.github.io`](https://github.com/AustinT/AustinT.github.io) — public website.

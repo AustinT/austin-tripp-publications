@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STAGED_BIB=$(git diff --cached --name-only --diff-filter=ACM | grep '\.bib$' || true)
+
+[ -z "$STAGED_BIB" ] && exit 0
+
+if ! command -v biber &>/dev/null; then
+    echo "pre-commit: biber not found, skipping BibTeX validation" >&2
+    exit 0
+fi
+
+FAILED=0
+for f in $STAGED_BIB; do
+    # --tool without --validate-datamodel: catches parse errors, skips custom-field warnings
+    if ! biber --tool "$f" &>/dev/null; then
+        echo "biber: syntax error in $f" >&2
+        # Show only ERROR/FATAL lines from the log
+        grep -E '^(ERROR|FATAL)' "${f%.bib}_bibertool.bib.blg" 2>/dev/null || \
+            grep -E '^(ERROR|FATAL)' "${f}.blg" 2>/dev/null || true
+        FAILED=1
+    fi
+    rm -f "${f%.bib}_bibertool.bib" "${f%.bib}.blg" "${f}.blg"
+done
+
+[ "$FAILED" -eq 0 ] && echo "biber: BibTeX OK" || exit 1
