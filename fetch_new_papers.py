@@ -13,7 +13,9 @@ Usage:
     uv run fetch_new_papers.py
 
 The script compares papers returned by the Semantic Scholar author API against
-all entries in papers.bib, workshops.bib, and preprints.bib. New papers are
+all entries in papers.bib, workshops.bib, and preprints.bib (matching on DOI,
+arXiv ID, or title). Record the arXiv version of a published or workshop paper
+via `authoritative_link` so it is recognised even when titles differ. New papers are
 written to new_papers_draft.bib with placeholder custom fields for manual review.
 
 Configuration: set SEMANTIC_SCHOLAR_AUTHOR_ID below, or find your ID at
@@ -64,20 +66,43 @@ def _normalize(text: str) -> str:
     return re.sub(r"[^a-z0-9]", "", text.lower())
 
 
-def load_existing_keys(bib_files: list[Path]) -> tuple[set[str], set[str]]:
-    """Return (normalized DOIs, normalized titles) from existing bib files."""
+# Matches new-style (2406.07709) and old-style (hep-th/9901001) arXiv IDs when they
+# appear as "arXiv:ID", in an arxiv.org URL, or in an arXiv DOI (10.48550/arXiv.ID).
+_ARXIV_ID_RE = re.compile(
+    r"(?:arxiv[:./]|arxiv\.org/(?:abs|pdf)/)\s*"
+    r"(\d{4}\.\d{4,5}|[a-z\-]+(?:\.[a-z]{2})?/\d{7})(?:v\d+)?",
+    re.IGNORECASE,
+)
+# Fields that may carry an arXiv reference (e.g. journal={arXiv preprint arXiv:...},
+# or authoritative_link pointing at the arXiv version of a published paper).
+_ARXIV_FIELDS = ("journal", "eprint", "url", "authoritative_link", "doi", "note", "pdf")
+
+
+def _arxiv_ids_in(entry: dict) -> set[str]:
+    """Return normalized (lowercase, version-stripped) arXiv IDs referenced by an entry."""
+    ids: set[str] = set()
+    for field in _ARXIV_FIELDS:
+        ids.update(m.lower() for m in _ARXIV_ID_RE.findall(entry.get(field, "")))
+    return ids
+
+
+def load_existing_keys(bib_files: list[Path]) -> tuple[set[str], set[str], set[str]]:
+    """Return (normalized DOIs, normalized titles, arXiv IDs) from existing bib files."""
     dois: set[str] = set()
     titles: set[str] = set()
+    arxiv_ids: set[str] = set()
     for path in bib_files:
         if not path.exists():
             continue
-        lib = bibtexparser.load(open(path))
+        with open(path) as f:
+            lib = bibtexparser.load(f)
         for entry in lib.entries:
             if doi := entry.get("doi", "").strip():
                 dois.add(_normalize(doi))
             if title := entry.get("title", "").strip():
                 titles.add(_normalize(title))
-    return dois, titles
+            arxiv_ids |= _arxiv_ids_in(entry)
+    return dois, titles, arxiv_ids
 
 
 def _get(url: str, **kwargs) -> requests.Response:
@@ -276,8 +301,11 @@ def main() -> None:
 
     bib_paths = [REPO_DIR / f for f in BIB_FILES]
     print(f"Loading existing entries from {', '.join(BIB_FILES)}...")
-    known_dois, known_titles = load_existing_keys(bib_paths)
-    print(f"  {len(known_dois)} known DOIs, {len(known_titles)} known titles.")
+    known_dois, known_titles, known_arxiv = load_existing_keys(bib_paths)
+    print(
+        f"  {len(known_dois)} known DOIs, {len(known_titles)} known titles, "
+        f"{len(known_arxiv)} known arXiv IDs."
+    )
 
     print(f"\nFetching papers for author ID(s) {', '.join(author_ids)} from Semantic Scholar...")
     papers = fetch_papers_for_authors(author_ids)
@@ -287,7 +315,12 @@ def main() -> None:
     for paper in papers:
         title = paper.get("title", "")
         doi = (paper.get("externalIds") or {}).get("DOI", "")
+        arxiv = (paper.get("externalIds") or {}).get("ArXiv", "")
         if doi and _normalize(doi) in known_dois:
+            continue
+        # Catches papers whose title differs between venues (e.g. a workshop title
+        # vs. the arXiv title) as long as one entry records the arXiv ID.
+        if arxiv and arxiv.lower() in known_arxiv:
             continue
         if title and _normalize(title) in known_titles:
             continue
