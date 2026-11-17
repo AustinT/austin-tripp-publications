@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#   "bibtexparser>=1.4",
+#   "bibtexparser>=1.4,<2",
 #   "requests>=2.31",
 # ]
 # ///
@@ -23,6 +23,7 @@ numeric ID like /author/Austin-Tripp/2145663280.
 
 import re
 import sys
+import time
 import unicodedata
 from pathlib import Path
 
@@ -33,7 +34,12 @@ import requests
 # Configuration
 # ---------------------------------------------------------------------------
 
-SEMANTIC_SCHOLAR_AUTHOR_ID = "115766771"  # Austin Tripp — update if this is wrong
+# Semantic Scholar sometimes splits one person into several author profiles, so
+# list every ID that belongs to you. Results are merged and deduplicated.
+SEMANTIC_SCHOLAR_AUTHOR_IDS = [
+    "115766771",
+    "2264318847",  # second profile holding recent papers (merge requested)
+]
 REPO_DIR = Path(__file__).parent
 BIB_FILES = ["papers.bib", "workshops.bib", "preprints.bib"]
 OUTPUT_FILE = REPO_DIR / "new_papers_draft.bib"
@@ -74,14 +80,26 @@ def load_existing_keys(bib_files: list[Path]) -> tuple[set[str], set[str]]:
     return dois, titles
 
 
+def _get(url: str, **kwargs) -> requests.Response:
+    """GET with retry/backoff on Semantic Scholar rate limiting (HTTP 429)."""
+    for attempt in range(6):
+        resp = requests.get(url, timeout=15, **kwargs)
+        if resp.status_code != 429:
+            resp.raise_for_status()
+            return resp
+        wait = 2 ** attempt
+        print(f"  Rate limited (429); retrying in {wait}s...")
+        time.sleep(wait)
+    resp.raise_for_status()
+    return resp
+
+
 def search_author(name: str) -> str | None:
     """Interactive: search Semantic Scholar for an author and return their ID."""
-    resp = requests.get(
+    resp = _get(
         f"{SS_API_BASE}/author/search",
         params={"query": name, "fields": "name,affiliations,paperCount"},
-        timeout=15,
     )
-    resp.raise_for_status()
     data = resp.json().get("data", [])
     if not data:
         print("No authors found.")
@@ -100,19 +118,29 @@ def fetch_author_papers(author_id: str) -> list[dict]:
     """Return all papers for the given Semantic Scholar author ID."""
     url = f"{SS_API_BASE}/author/{author_id}/papers"
     params = {
-        "fields": "title,year,authors,externalIds,venue,publicationTypes",
-        "limit": 200,
+        "fields": "paperId,title,year,authors,externalIds,venue,publicationTypes",
+        "limit": 100,
     }
     papers: list[dict] = []
     while True:
-        resp = requests.get(url, params=params, timeout=15)
-        resp.raise_for_status()
-        body = resp.json()
+        body = _get(url, params=params).json()
         papers.extend(body.get("data", []))
-        if not (token := body.get("next")):
+        # The API pages with an integer offset; "next" is absent on the last page.
+        if (next_offset := body.get("next")) is None:
             break
-        params["token"] = token
+        params["offset"] = next_offset
     return papers
+
+
+def fetch_papers_for_authors(author_ids: list[str]) -> list[dict]:
+    """Fetch and merge papers across several author IDs, deduplicated by paperId."""
+    merged: dict[str, dict] = {}
+    for author_id in author_ids:
+        papers = fetch_author_papers(author_id)
+        print(f"  {author_id}: {len(papers)} papers")
+        for paper in papers:
+            merged.setdefault(paper.get("paperId") or paper.get("title", ""), paper)
+    return list(merged.values())
 
 
 def _is_arxiv_doi(doi: str) -> bool:
@@ -235,24 +263,25 @@ def inject_placeholder_fields(bibtex: str) -> str:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    author_id = SEMANTIC_SCHOLAR_AUTHOR_ID.strip()
+    author_ids = [a.strip() for a in SEMANTIC_SCHOLAR_AUTHOR_IDS if a.strip()]
 
-    if not author_id:
-        print("SEMANTIC_SCHOLAR_AUTHOR_ID is not set.")
+    if not author_ids:
+        print("SEMANTIC_SCHOLAR_AUTHOR_IDS is empty.")
         name = input("Enter your name to search Semantic Scholar: ").strip()
         author_id = search_author(name)
         if not author_id:
             sys.exit(1)
-        print(f'\nTip: set SEMANTIC_SCHOLAR_AUTHOR_ID = "{author_id}" in this script to skip this next time.\n')
+        author_ids = [author_id]
+        print(f'\nTip: add "{author_id}" to SEMANTIC_SCHOLAR_AUTHOR_IDS in this script to skip this next time.\n')
 
     bib_paths = [REPO_DIR / f for f in BIB_FILES]
     print(f"Loading existing entries from {', '.join(BIB_FILES)}...")
     known_dois, known_titles = load_existing_keys(bib_paths)
     print(f"  {len(known_dois)} known DOIs, {len(known_titles)} known titles.")
 
-    print(f"\nFetching papers for author ID {author_id} from Semantic Scholar...")
-    papers = fetch_author_papers(author_id)
-    print(f"  {len(papers)} papers returned.")
+    print(f"\nFetching papers for author ID(s) {', '.join(author_ids)} from Semantic Scholar...")
+    papers = fetch_papers_for_authors(author_ids)
+    print(f"  {len(papers)} unique papers returned.")
 
     new_papers = []
     for paper in papers:
